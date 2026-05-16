@@ -62,12 +62,12 @@ DEFAULT_PAIR = "EURUSD"
 # ─────────────────────────────────────────────────────────────────────────────
 
 TIMEFRAME_MAP = {
-    "5m":      ("5m",  "5d"),
-    "15m":     ("15m", "60d"),
-    "30m":     ("30m", "60d"),
-    "1h":      ("1h",  "60d"),
-    "4h":      ("1h",  "60d"),   # resampled from 1h → 4h
-    "daily":   ("1d",  "2y"),
+    "5m":      ("5m",  "2d"),    # ~576 candles  — recent price action
+    "15m":     ("15m", "6d"),    # ~576 candles
+    "30m":     ("30m", "15d"),   # ~720 candles
+    "1h":      ("1h",  "30d"),   # ~720 candles
+    "4h":      ("1h",  "90d"),   # ~540 candles  (resampled from 1h)
+    "daily":   ("1d",  "2y"),    # ~500 candles — needs more for daily ML
     "weekly":  ("1wk", "5y"),
     "monthly": ("1mo", "10y"),
 }
@@ -77,13 +77,15 @@ TIMEFRAME_MAP = {
 #  CORE FETCH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_candles(timeframe: str = "1h", pair: str = DEFAULT_PAIR) -> pd.DataFrame:
+def fetch_candles(timeframe: str = "1h", pair: str = DEFAULT_PAIR,
+                  period: str = None) -> pd.DataFrame:
     """
     Fetch OHLCV candles for any supported pair.
 
     Args:
         timeframe : one of TIMEFRAME_MAP keys ("15m","30m","1h","4h","daily","weekly","monthly")
         pair      : key from PAIRS dict (e.g. "EURUSD", "GBPUSD", "XAUUSD", "USDCHF", "USDJPY")
+        period    : override default period (e.g. "730d", "1y", "2y")
 
     Returns:
         DataFrame with columns: open, high, low, close, volume
@@ -95,7 +97,8 @@ def fetch_candles(timeframe: str = "1h", pair: str = DEFAULT_PAIR) -> pd.DataFra
         raise ValueError(f"Invalid timeframe '{timeframe}'. Choose from: {list(TIMEFRAME_MAP.keys())}")
 
     ticker_sym = PAIRS[pair]["ticker"]
-    interval, period = TIMEFRAME_MAP[timeframe]
+    interval, default_period = TIMEFRAME_MAP[timeframe]
+    period = period or default_period
     label = PAIRS[pair]["display"]
 
     print(f"[RadarFX] Fetching {label} {timeframe} candles...")
