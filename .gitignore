@@ -1,6 +1,4 @@
 .env
-*.pkl
-models/
 __pycache__/
 .news_cache.json
 *.pyc
