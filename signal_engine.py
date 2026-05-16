@@ -59,15 +59,15 @@ def calc_sl_tp(entry: float, direction: str, atr: float,
     Returns:
         dict with sl, tp1, tp2, risk_pips, reward_pips, rr
     """
-    atr_buffer = atr * 1.2
+    atr_buffer = atr * 2.0   # wider SL gives market room to breathe
 
     if direction == "buy":
-        sl   = round(min(entry - atr_buffer, support  - atr * 0.3), decimals)
+        sl   = round(min(entry - atr_buffer, support  - atr * 0.5), decimals)
         risk = round(entry - sl, decimals)
         tp1  = round(entry + risk * rr_ratio,             decimals)
         tp2  = round(min(entry + risk * rr_ratio * 1.8, resistance), decimals)
     else:  # sell
-        sl   = round(max(entry + atr_buffer, resistance + atr * 0.3), decimals)
+        sl   = round(max(entry + atr_buffer, resistance + atr * 0.5), decimals)
         risk = round(sl - entry, decimals)
         tp1  = round(entry - risk * rr_ratio,             decimals)
         tp2  = round(max(entry - risk * rr_ratio * 1.8, support),   decimals)
@@ -94,12 +94,15 @@ def calc_confidence(analyses: dict, direction: str) -> int:
     total_weight = 0
     agree_weight = 0
 
+    # direction is "buy"/"sell", bias is "bullish"/"bearish"
+    target_bias = "bullish" if direction == "buy" else "bearish"
+
     for tf, result in analyses.items():
         w    = TF_WEIGHTS.get(tf, 1)
         bias = result.get("bias", "neutral")
         total_weight += w
 
-        if bias == direction:
+        if bias == target_bias:
             agree_weight += w
         elif bias in ("ranging", "neutral"):
             agree_weight += w * 0.3   # partial credit
@@ -114,17 +117,21 @@ def calc_confidence(analyses: dict, direction: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_tf_confirmations(analyses: dict, direction: str) -> dict:
+    target_bias = "bullish" if direction == "buy" else "bearish"
+    opposite    = "bearish" if direction == "buy" else "bullish"
     confirmations = {}
     for tf, result in analyses.items():
         bias = result.get("bias", "neutral")
-        if bias == direction:
+        if bias == target_bias:
             confirmations[tf] = "confirmed"
         elif bias == "ranging":
             confirmations[tf] = "ranging"
         elif bias == "neutral":
             confirmations[tf] = "neutral"
-        else:
+        elif bias == opposite:
             confirmations[tf] = "against"
+        else:
+            confirmations[tf] = "neutral"
     return confirmations
 
 
@@ -172,6 +179,32 @@ def generate_signal(timeframe_data: dict,
             bear_score  += w
         elif bias == "ranging":
             any_ranging += w
+
+    # ── Block if weekly is ranging (no clear weekly direction = no trade) ────
+    weekly_bias = analyses.get("weekly", {}).get("bias", "neutral")
+    if weekly_bias == "ranging":
+        return {
+            "signal":     "WAIT",
+            "pair":       display,
+            "reason":     "Weekly timeframe is ranging — wait for a clear trend.",
+            "confidence": 0,
+            "timestamp":  datetime.utcnow().isoformat(),
+            "analyses":   analyses,
+        }
+
+    # ── Require 1h to confirm direction (no neutral short-term entries) ──────
+    tf_1h_bias = analyses.get("1h", {}).get("bias", "neutral")
+    tf_4h_bias = analyses.get("4h", {}).get("bias", "neutral")
+    # If both 1h AND 4h are neutral, skip — no short-term confirmation
+    if tf_1h_bias == "neutral" and tf_4h_bias == "neutral":
+        return {
+            "signal":     "WAIT",
+            "pair":       display,
+            "reason":     "No short-term confirmation (1h and 4h both neutral).",
+            "confidence": 0,
+            "timestamp":  datetime.utcnow().isoformat(),
+            "analyses":   analyses,
+        }
 
     # ── Block signal if market is dominated by ranging ────────────────────────
     if any_ranging / max(total_w, 1) > 0.4:
