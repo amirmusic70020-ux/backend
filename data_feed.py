@@ -64,9 +64,9 @@ DEFAULT_PAIR = "EURUSD"
 TIMEFRAME_MAP = {
     "5m":      ("5m",  "2d"),    # ~576 candles  — recent price action
     "15m":     ("15m", "6d"),    # ~576 candles
-    "30m":     ("30m", "15d"),   # ~720 candles
-    "1h":      ("1h",  "30d"),   # ~720 candles
-    "4h":      ("1h",  "90d"),   # ~540 candles  (resampled from 1h)
+    "30m":     ("30m", "30d"),   # ~1440 candles
+    "1h":      ("1h",  "60d"),   # ~1440 candles — more data for RL
+    "4h":      ("1h",  "180d"),  # ~1080 candles  (resampled from 1h)
     "daily":   ("1d",  "2y"),    # ~500 candles — needs more for daily ML
     "weekly":  ("1wk", "5y"),
     "monthly": ("1mo", "10y"),

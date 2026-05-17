@@ -1,323 +1,353 @@
 """
 RadarFX — backtest.py
-Backtests the signal engine on XAU/USD (Gold) for the past 7 days.
+Tests ML + RL models on real historical data.
+Shows win rate, total pips, drawdown, and trade log.
 
-Method:
-  - Fetches 60 days of 1h candles for XAU/USD
-  - Walks forward candle by candle through the last 7 days
-  - Every 4 hours: uses only past data to generate a signal (no lookahead)
-  - If BUY or SELL fires: looks forward up to 96 candles (4 days) to see
-    whether TP1 or SL is hit first
-  - Prints a full report at the end
-
-Run:
-  python backtest.py
+Usage
+-----
+    python backtest.py EURUSD --tf 1h
+    python backtest.py EURUSD --tf 4h --plot
+    python backtest.py all --tf 1h
 """
 
-import pandas as pd
+import os, sys, argparse, time
 import numpy as np
-from datetime import datetime, timedelta, timezone
+import pandas as pd
 
-import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from data_feed    import fetch_candles, PAIRS
-from analyzer     import analyze, calc_atr
-from signal_engine import calc_sl_tp, calc_confidence, get_tf_confirmations, TF_WEIGHTS, MIN_CONFIDENCE, MIN_AGREEMENT
+from data_feed import fetch_candles, PAIRS
+from ml_model  import add_features, FEATURE_COLS, LOOKBACK, predict as ml_predict
+from rl_env    import ForexTradingEnv
+from rl_agent  import DQNAgent
 
-# ─────────────────────────────────────────────────────────────────────────────
-import sys as _sys
-_arg = _sys.argv[1].upper() if len(_sys.argv) > 1 else "XAUUSD"
-PAIR = _arg if _arg in PAIRS else "XAUUSD"
-if _arg not in PAIRS:
-    print(f"Unknown pair '{_arg}'. Using XAUUSD. Available: {list(PAIRS.keys())}")
-
-PAIR_INFO   = PAIRS[PAIR]
-DAYS_BACK   = 30         # test window (30 days for more signals)
-CHECK_EVERY = 4          # hours between signal checks
-MAX_HOLD    = 96         # max candles to wait for TP/SL (hours)
-
-# Backtest uses slightly looser thresholds to find more signals
-BT_MIN_CONFIDENCE = 55   # live system uses 65
-BT_MIN_AGREEMENT  = 0.45 # live system uses 0.55
-# ─────────────────────────────────────────────────────────────────────────────
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 
-def print_separator(char="─", width=60):
-    print(char * width)
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+def rl_model_path(pair, tf):
+    return os.path.join(MODEL_DIR, f"rl_{pair}_{tf}.npz")
+
+def ml_model_exists(pair, tf):
+    key = f"{pair}_{tf}"
+    return all(os.path.exists(os.path.join(MODEL_DIR, f"{key}_{q}.pkl"))
+               for q in ["bear","median","bull"])
+
+def rl_model_exists(pair, tf):
+    return os.path.exists(rl_model_path(pair, tf) + ".npz") or \
+           os.path.exists(rl_model_path(pair, tf))
+
+def pct(a, b):
+    return f"{'+' if a>=b else ''}{((a/b-1)*100):.2f}%"
 
 
-def generate_signal_from_slice(df_1h: pd.DataFrame, df_daily_full: pd.DataFrame,
-                               df_weekly_full: pd.DataFrame = None, debug=False) -> dict | None:
-    """
-    Generate a signal using only data available at this point in time.
-    df_daily_full : 2 years of daily data (for EMA200)
-    df_weekly_full: weekly data (for trend filter)
-    """
-    if len(df_1h) < 50:
-        return None
+# ─── Backtest engine ─────────────────────────────────────────────────────────
 
-    # Build 4h candles from 1h data
-    df_4h = df_1h.resample("4h").agg({
-        "open": "first", "high": "max", "low": "min",
-        "close": "last", "volume": "sum"
-    }).dropna()
+def backtest(pair: str, tf: str, plot: bool = False) -> dict:
+    pip_factor  = PAIRS[pair]["pip_factor"]
+    pip_label   = PAIRS[pair]["pip_label"]
+    decimals    = PAIRS[pair]["decimals"]
+    spread_pips = 5.0 if pair == "XAUUSD" else 2.0
 
-    timeframe_data = {}
-    if df_weekly_full is not None and len(df_weekly_full) >= 20:
-        timeframe_data["weekly"] = df_weekly_full
-    if len(df_daily_full) >= 50: timeframe_data["daily"] = df_daily_full
-    if len(df_4h)         >= 20: timeframe_data["4h"]    = df_4h
-    if len(df_1h)         >= 50: timeframe_data["1h"]    = df_1h
+    # ── 1. Fetch data ────────────────────────────────────────────
+    print(f"\n{'═'*60}")
+    print(f"  Backtest: {PAIRS[pair]['display']} | {tf}")
+    print(f"{'═'*60}")
 
-    if not timeframe_data:
-        return None
+    df_raw = fetch_candles(tf, pair=pair)
+    if df_raw is None or df_raw.empty:
+        print("  ✗ No data"); return {}
 
-    from analyzer import analyze_multi
-    analyses = analyze_multi(timeframe_data)
+    df = add_features(df_raw)
 
-    bull_score = bear_score = total_w = any_ranging = 0
-    for tf, result in analyses.items():
-        w    = TF_WEIGHTS.get(tf, 1)
-        bias = result.get("bias", "neutral")
-        total_w += w
-        if bias == "bullish":  bull_score  += w
-        elif bias == "bearish": bear_score  += w
-        elif bias == "ranging": any_ranging += w
+    # Use last 20% of data as unseen test set
+    split    = int(len(df) * 0.80)
+    df_test  = df.iloc[split:].reset_index(drop=True)
+    closes   = df_test["close"].values
+    n        = len(df_test)
 
-    ranging_pct = any_ranging / max(total_w, 1)
-    bull_pct    = bull_score  / max(total_w, 1)
-    bear_pct    = bear_score  / max(total_w, 1)
+    if n < 30:
+        print(f"  ✗ Test set too small ({n} bars)"); return {}
 
-    if debug:
-        bias_summary = {tf: r.get("bias","?") for tf, r in analyses.items()}
-        print(f"    biases={bias_summary} bull={bull_pct:.2f} bear={bear_pct:.2f} ranging={ranging_pct:.2f}")
+    print(f"  Test bars : {n}  ({df_test.index[0] if hasattr(df_test.index[0],'strftime') else 'start'} → end)")
+    print(f"  Spread    : {spread_pips} {pip_label}\n")
 
-    if ranging_pct > 0.4:
-        if debug: print(f"    → BLOCKED: ranging ({ranging_pct:.0%})")
-        return None
+    results = {}
 
-    # Block if weekly is ranging
-    if analyses.get("weekly", {}).get("bias", "neutral") == "ranging":
-        if debug: print(f"    → BLOCKED: weekly is ranging")
-        return None
+    # ══════════════════════════════════════════════════════════════
+    # STRATEGY 1 — ML Only
+    # ══════════════════════════════════════════════════════════════
+    if ml_model_exists(pair, tf):
+        trades   = []
+        equity   = [0.0]
+        position = 0
+        entry_px = 0.0
 
-    # Require at least 1h OR 4h to confirm (no purely daily signals)
-    bias_1h = analyses.get("1h", {}).get("bias", "neutral")
-    bias_4h = analyses.get("4h", {}).get("bias", "neutral")
-    if bias_1h == "neutral" and bias_4h == "neutral":
-        if debug: print(f"    → BLOCKED: 1h+4h both neutral (no short-term confirm)")
-        return None
+        for i in range(LOOKBACK, n - 1):
+            # Predict on window ending at bar i
+            df_window = df.iloc[:split + i]
+            try:
+                med, bull, bear, last_close = ml_predict(df_window, pair=f"{pair}_{tf}")
+            except Exception:
+                continue
 
-    if bull_score > bear_score and bull_pct >= BT_MIN_AGREEMENT:
-        direction = "buy"
-    elif bear_score > bull_score and bear_pct >= BT_MIN_AGREEMENT:
-        direction = "sell"
+            pct_chg = (float(med[-1]) / last_close - 1) * 100
+            signal  = "BUY" if pct_chg > 0.05 else "SELL" if pct_chg < -0.05 else "HOLD"
+
+            price = closes[i]
+
+            # Simple: enter on signal, exit when signal flips
+            if signal == "BUY" and position != 1:
+                if position == -1:
+                    pnl = (entry_px - price) * pip_factor - spread_pips
+                    trades.append({"type":"SELL","pnl":pnl,"bars":i})
+                    equity.append(equity[-1] + pnl)
+                position = 1; entry_px = price
+
+            elif signal == "SELL" and position != -1:
+                if position == 1:
+                    pnl = (price - entry_px) * pip_factor - spread_pips
+                    trades.append({"type":"BUY","pnl":pnl,"bars":i})
+                    equity.append(equity[-1] + pnl)
+                position = -1; entry_px = price
+
+        # Close any open position
+        if position != 0:
+            last = closes[-1]
+            pnl  = ((last - entry_px) if position == 1 else (entry_px - last)) * pip_factor - spread_pips
+            trades.append({"type":"CLOSE","pnl":pnl,"bars":n-1})
+            equity.append(equity[-1] + pnl)
+
+        ml_res = _stats(trades, equity, pip_label)
+        results["ML"] = ml_res
+        _print_stats("ML Only (Gradient Boosting)", ml_res, pip_label)
     else:
-        if debug: print(f"    → BLOCKED: no agreement (bull={bull_pct:.0%} bear={bear_pct:.0%} min={BT_MIN_AGREEMENT:.0%})")
-        return None
+        print("  ⚠ ML model not found — skipping ML backtest")
 
-    # calc_confidence expects "buy"/"sell" and maps internally to "bullish"/"bearish"
-    confidence = calc_confidence(analyses, direction)
-    if debug: print(f"    → direction={direction} confidence={confidence}%")
-    if confidence < BT_MIN_CONFIDENCE:
-        if debug: print(f"    → BLOCKED: low confidence ({confidence}% < {BT_MIN_CONFIDENCE}%)")
-        return None
+    # ══════════════════════════════════════════════════════════════
+    # STRATEGY 2 — RL Only
+    # ══════════════════════════════════════════════════════════════
+    path = rl_model_path(pair, tf)
+    if not os.path.exists(path + ".npz"):
+        path_candidate = path
+    else:
+        path_candidate = path + ".npz"
 
-    primary_an = analyses.get("1h") or analyses.get("4h") or list(analyses.values())[0]
-    entry      = round(float(df_1h["close"].iloc[-1]), PAIR_INFO["decimals"])
-    atr        = primary_an.get("atr", entry * 0.001)
-    support    = primary_an.get("support",    entry - atr * 3)
-    resistance = primary_an.get("resistance", entry + atr * 3)
+    rl_path = path + ".npz" if os.path.exists(path + ".npz") else path
 
-    levels = calc_sl_tp(
-        entry, direction, atr, support, resistance,
-        pip_factor=PAIR_INFO["pip_factor"],
-        decimals=PAIR_INFO["decimals"],
-    )
+    if os.path.exists(rl_path):
+        agent = DQNAgent.load(rl_path, state_dim=ForexTradingEnv.STATE_DIM)
+
+        env    = ForexTradingEnv(df_test, pip_factor=pip_factor, spread_pips=spread_pips)
+        state  = env.reset()
+        equity = [0.0]
+        trades = []
+
+        while True:
+            action          = agent._greedy(state)
+            prev_trades     = env.n_trades
+            prev_pips       = env.total_pips
+            state, r, done  = env.step(action)
+
+            if env.n_trades > prev_trades:
+                pnl = env.total_pips - prev_pips
+                trades.append({"type": ["HOLD","BUY","SELL"][action], "pnl": pnl})
+                equity.append(env.total_pips)
+
+            if done: break
+
+        rl_res = _stats(trades, equity, pip_label)
+        results["RL"] = rl_res
+        _print_stats("RL Only (DQN Agent)", rl_res, pip_label)
+    else:
+        print("  ⚠ RL model not found — skipping RL backtest")
+        print(f"    Train first: python rl_train.py {pair} --tf {tf}")
+
+    # ══════════════════════════════════════════════════════════════
+    # STRATEGY 3 — ML + RL Combined (enter only when both agree)
+    # ══════════════════════════════════════════════════════════════
+    if "ML" in results and "RL" in results and os.path.exists(rl_path):
+        agent    = DQNAgent.load(rl_path, state_dim=ForexTradingEnv.STATE_DIM)
+        trades   = []
+        equity   = [0.0]
+        position = 0
+        entry_px = 0.0
+
+        feats  = df_test[FEATURE_COLS].values.astype(np.float32)
+
+        for i in range(LOOKBACK, n - 1):
+            # ML signal
+            df_window = df.iloc[:split + i]
+            try:
+                med, _, _, last_close = ml_predict(df_window, pair=f"{pair}_{tf}")
+                pct_chg  = (float(med[-1]) / last_close - 1) * 100
+                ml_sig   = "BUY" if pct_chg > 0.05 else "SELL" if pct_chg < -0.05 else "HOLD"
+            except Exception:
+                continue
+
+            # RL signal (current bar features, flat position)
+            feat   = feats[i].copy()
+            state  = np.concatenate([feat, np.zeros(3, dtype=np.float32)])
+            q_vals = agent.q.forward(state.reshape(1,-1))[0]
+            rl_act = int(np.argmax(q_vals))
+            rl_sig = ["HOLD","BUY","SELL"][rl_act]
+
+            price = closes[i]
+
+            # Only enter when BOTH agree
+            combined = "BUY"  if ml_sig == "BUY"  and rl_sig == "BUY"  else \
+                       "SELL" if ml_sig == "SELL" and rl_sig == "SELL" else \
+                       "HOLD"
+
+            if combined == "BUY" and position != 1:
+                if position == -1:
+                    pnl = (entry_px - price) * pip_factor - spread_pips
+                    trades.append({"type":"SELL","pnl":pnl})
+                    equity.append(equity[-1] + pnl)
+                position = 1; entry_px = price
+
+            elif combined == "SELL" and position != -1:
+                if position == 1:
+                    pnl = (price - entry_px) * pip_factor - spread_pips
+                    trades.append({"type":"BUY","pnl":pnl})
+                    equity.append(equity[-1] + pnl)
+                position = -1; entry_px = price
+
+            elif combined == "HOLD" and position != 0:
+                # Exit when conflicted
+                if position == 1:
+                    pnl = (price - entry_px) * pip_factor - spread_pips
+                elif position == -1:
+                    pnl = (entry_px - price) * pip_factor - spread_pips
+                trades.append({"type":"EXIT","pnl":pnl})
+                equity.append(equity[-1] + pnl)
+                position = 0
+
+        # Close open position
+        if position != 0:
+            last = closes[-1]
+            pnl  = ((last-entry_px) if position==1 else (entry_px-last))*pip_factor - spread_pips
+            trades.append({"type":"CLOSE","pnl":pnl})
+            equity.append(equity[-1] + pnl)
+
+        comb_res = _stats(trades, equity, pip_label)
+        results["COMBINED"] = comb_res
+        _print_stats("ML + RL Combined (both must agree)", comb_res, pip_label)
+
+    # ── Summary comparison ───────────────────────────────────────
+    if len(results) > 1:
+        print(f"\n{'─'*60}")
+        print(f"  {'SUMMARY':^56}")
+        print(f"{'─'*60}")
+        print(f"  {'Strategy':<28} {'Total':>8} {'Win%':>7} {'Trades':>7} {'MaxDD':>8}")
+        print(f"  {'─'*56}")
+        for name, r in results.items():
+            print(f"  {name:<28} {r['total_pips']:>+8.1f} {r['win_rate']:>6.1f}% "
+                  f"{r['n_trades']:>7} {r['max_dd']:>+8.1f}")
+        print(f"{'═'*60}\n")
+
+    # ── Optional matplotlib plot ─────────────────────────────────
+    if plot and results:
+        _plot(results, pair, tf, pip_label)
+
+    return results
+
+
+# ─── Stats helper ─────────────────────────────────────────────────────────────
+
+def _stats(trades: list, equity: list, pip_label: str) -> dict:
+    if not trades:
+        return {"total_pips":0,"win_rate":0,"n_trades":0,"avg_pip":0,"max_dd":0,"equity":[0]}
+
+    pnls     = [t["pnl"] for t in trades]
+    wins     = [p for p in pnls if p > 0]
+    total    = sum(pnls)
+    win_rate = len(wins) / len(pnls) * 100 if pnls else 0
+    avg_pip  = total / len(pnls) if pnls else 0
+
+    # Max drawdown
+    eq   = np.array(equity)
+    peak = np.maximum.accumulate(eq)
+    dd   = eq - peak
+    max_dd = float(dd.min())
 
     return {
-        "signal":     "BUY" if direction == "buy" else "SELL",
-        "entry":      entry,
-        "sl":         levels["sl"],
-        "tp1":        levels["tp1"],
-        "tp2":        levels["tp2"],
-        "risk_pts":   levels["risk_pips"],
-        "reward_pts": levels["reward_pips"],
-        "rr":         levels["rr"],
-        "confidence": confidence,
+        "total_pips": round(total, 1),
+        "win_rate":   round(win_rate, 1),
+        "n_trades":   len(pnls),
+        "avg_pip":    round(avg_pip, 1),
+        "max_dd":     round(max_dd, 1),
+        "equity":     equity,
     }
 
 
-def check_outcome(future_candles: pd.DataFrame, signal: dict) -> dict:
-    """
-    Walk future candles to see if TP1 or SL is hit first.
-    Returns: { result: WIN/LOSS/OPEN, pnl_pts, candles_held }
-    """
-    direction = signal["signal"]
-    tp1 = signal["tp1"]
-    sl  = signal["sl"]
-
-    for i, (ts, row) in enumerate(future_candles.iterrows()):
-        high = row["high"]
-        low  = row["low"]
-
-        if direction == "BUY":
-            if low  <= sl:  return {"result": "LOSS", "pnl_pts": -signal["risk_pts"],   "candles": i+1, "exit": sl}
-            if high >= tp1: return {"result": "WIN",  "pnl_pts":  signal["reward_pts"],  "candles": i+1, "exit": tp1}
-        else:  # SELL
-            if high >= sl:  return {"result": "LOSS", "pnl_pts": -signal["risk_pts"],   "candles": i+1, "exit": sl}
-            if low  <= tp1: return {"result": "WIN",  "pnl_pts":  signal["reward_pts"],  "candles": i+1, "exit": tp1}
-
-    return {"result": "OPEN", "pnl_pts": 0, "candles": len(future_candles), "exit": None}
+def _print_stats(title: str, r: dict, pip_label: str):
+    bar  = "█" * min(int(r["win_rate"] / 5), 20)
+    sign = "✅" if r["total_pips"] > 0 else "❌"
+    print(f"  ┌─ {title}")
+    print(f"  │  Total P&L   : {r['total_pips']:+.1f} {pip_label}  {sign}")
+    print(f"  │  Win Rate    : {r['win_rate']:.1f}%  {bar}")
+    print(f"  │  Trades      : {r['n_trades']}")
+    print(f"  │  Avg/trade   : {r['avg_pip']:+.1f} {pip_label}")
+    print(f"  │  Max Drawdown: {r['max_dd']:+.1f} {pip_label}")
+    print(f"  └{'─'*50}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _plot(results: dict, pair: str, tf: str, pip_label: str):
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
 
-def run_backtest():
-    print_separator("═")
-    print(f"  RadarFX Backtest — {PAIR_INFO['display']}")
-    print(f"  Window : Last {DAYS_BACK} days")
-    print(f"  Signal check every {CHECK_EVERY} hours")
-    print_separator("═")
+        colors = {"ML":"#448aff", "RL":"#00e6b4", "COMBINED":"#ffca28"}
+        fig, ax = plt.subplots(figsize=(12, 5))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#0d1117")
 
-    # Fetch data
-    print(f"\n[1] Fetching {PAIR_INFO['display']} data...")
-    df_full = fetch_candles("1h", pair=PAIR)
-    if df_full.empty:
-        print("ERROR: No data returned.")
-        return
-    print(f"    Fetching daily data (2 years) for EMA200...")
-    df_daily_all = fetch_candles("daily", pair=PAIR)
-    if df_daily_all.empty:
-        print("ERROR: No daily data returned.")
-        return
-    print(f"    Fetching weekly data for trend filter...")
-    df_weekly_all = fetch_candles("weekly", pair=PAIR)
-    if df_weekly_all.empty:
-        print("WARNING: No weekly data — continuing without it.")
+        for name, r in results.items():
+            eq = r["equity"]
+            ax.plot(eq, label=f"{name} ({r['total_pips']:+.0f} {pip_label})",
+                    color=colors.get(name,"white"), linewidth=2)
 
-    # Timezone-aware cutoff
-    now      = pd.Timestamp.now(tz="UTC")
-    cutoff   = now - pd.Timedelta(days=DAYS_BACK)
-    df_test  = df_full[df_full.index >= cutoff]
+        ax.axhline(0, color="white", linewidth=0.5, alpha=0.3)
+        ax.set_title(f"RadarFX Backtest — {PAIRS[pair]['display']} {tf}",
+                     color="white", fontsize=14, pad=12)
+        ax.set_xlabel("Trades", color="#888")
+        ax.set_ylabel(f"Cumulative {pip_label}", color="#888")
+        ax.tick_params(colors="#888")
+        ax.spines["bottom"].set_color("#333")
+        ax.spines["left"].set_color("#333")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(facecolor="#1a1a2e", edgecolor="#333", labelcolor="white")
 
-    print(f"[2] Test window: {cutoff.date()} → {now.date()}")
-    print(f"    Total candles in window: {len(df_test)}")
+        save_path = os.path.join(os.path.dirname(__file__),
+                                 f"backtest_{pair}_{tf}.png")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  📊 Chart saved → {save_path}")
+    except Exception as e:
+        print(f"  (plot skipped: {e})")
 
-    if len(df_test) < 10:
-        print("ERROR: Not enough candles in the test window.")
-        return
 
-    # Walk forward
-    print(f"\n[3] Walking forward (every {CHECK_EVERY} hours)...\n")
-    signals_found = []
-    last_signal_time = None
+# ─── CLI ─────────────────────────────────────────────────────────────────────
 
-    for i in range(50, len(df_test)):
-        current_ts  = df_test.index[i]
-        current_pos = df_full.index.get_loc(current_ts)
+def main():
+    parser = argparse.ArgumentParser(description="RadarFX Backtest Engine")
+    parser.add_argument("pair", help="Pair (EURUSD, …) or 'all'")
+    parser.add_argument("--tf",   default="1h")
+    parser.add_argument("--plot", action="store_true",
+                        help="Save equity curve as PNG")
+    args = parser.parse_args()
 
-        # Check only every CHECK_EVERY hours
-        if last_signal_time and (current_ts - last_signal_time).total_seconds() < CHECK_EVERY * 3600:
-            continue
+    pairs = list(PAIRS.keys()) if args.pair.upper()=="ALL" else [args.pair.upper()]
 
-        # Use all data up to (not including) current candle
-        history = df_full.iloc[:current_pos]
-        if len(history) < 50:
-            continue
-
-        # Slice daily/weekly data up to current date (no lookahead)
-        current_date  = current_ts.date()
-        history_daily  = df_daily_all[df_daily_all.index.date < current_date]
-        history_weekly = df_weekly_all[df_weekly_all.index.date < current_date] if not df_weekly_all.empty else pd.DataFrame()
-
-        sig = generate_signal_from_slice(history, history_daily, history_weekly, debug=(i < 60))
-        if sig is None:
-            continue
-
-        # Found a signal — check outcome on future candles
-        future = df_test.iloc[i+1 : i+1+MAX_HOLD]
-        if future.empty:
-            continue
-
-        outcome = check_outcome(future, sig)
-
-        record = {
-            "time":       current_ts,
-            "signal":     sig["signal"],
-            "entry":      sig["entry"],
-            "sl":         sig["sl"],
-            "tp1":        sig["tp1"],
-            "confidence": sig["confidence"],
-            "rr":         sig["rr"],
-            "risk_pts":   sig["risk_pts"],
-            **outcome,
-        }
-        signals_found.append(record)
-        last_signal_time = current_ts
-
-        # Print each signal as found
-        result_str = record["result"]
-        pnl_str    = f"+{record['pnl_pts']:.1f}" if record["pnl_pts"] > 0 else f"{record['pnl_pts']:.1f}"
-        dec = PAIR_INFO["decimals"]
-        print(
-            f"  {str(current_ts)[:16]}  "
-            f"{sig['signal']:4s}  "
-            f"Entry:{sig['entry']:.{dec}f}  "
-            f"SL:{sig['sl']:.{dec}f}  "
-            f"TP1:{sig['tp1']:.{dec}f}  "
-            f"Conf:{sig['confidence']}%  "
-            f"→  {result_str:4s}  {pnl_str} pts  ({record['candles']}h)"
-        )
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    print_separator()
-    print(f"\n  BACKTEST RESULTS — {PAIR_INFO['display']} — Last {DAYS_BACK} days")
-    print_separator()
-
-    if not signals_found:
-        print("  No signals fired in this period.")
-        print("  (Market may have been in a range — WAIT is the correct response)")
-        print_separator()
-        return
-
-    total  = len(signals_found)
-    wins   = [r for r in signals_found if r["result"] == "WIN"]
-    losses = [r for r in signals_found if r["result"] == "LOSS"]
-    open_  = [r for r in signals_found if r["result"] == "OPEN"]
-
-    win_rate = len(wins) / (len(wins) + len(losses)) * 100 if (wins or losses) else 0
-    total_pnl = sum(r["pnl_pts"] for r in signals_found)
-    avg_conf  = sum(r["confidence"] for r in signals_found) / total
-
-    print(f"  Total signals  : {total}")
-    print(f"  Wins           : {len(wins)}")
-    print(f"  Losses         : {len(losses)}")
-    print(f"  Still open     : {len(open_)}")
-    print(f"  Win rate       : {win_rate:.1f}%")
-    print(f"  Total P&L      : {total_pnl:+.1f} pts")
-    print(f"  Avg confidence : {avg_conf:.1f}%")
-
-    if wins:
-        avg_win_h = sum(r["candles"] for r in wins) / len(wins)
-        print(f"  Avg hold (win) : {avg_win_h:.1f} hours")
-    if losses:
-        avg_loss_h = sum(r["candles"] for r in losses) / len(losses)
-        print(f"  Avg hold (loss): {avg_loss_h:.1f} hours")
-
-    print_separator()
-
-    if win_rate >= 60:
-        print("  Assessment: System performed well in this period.")
-    elif win_rate >= 40:
-        print("  Assessment: Mixed results — market may have been choppy.")
-    else:
-        print("  Assessment: Tough week for trend-following signals.")
-
-    print_separator("═")
-    print()
+    for pair in pairs:
+        if pair not in PAIRS:
+            print(f"Unknown pair: {pair}"); continue
+        backtest(pair, args.tf, plot=args.plot)
 
 
 if __name__ == "__main__":
-    run_backtest()
+    main()

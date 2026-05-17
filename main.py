@@ -8,6 +8,7 @@ import sys
 import time
 import base64
 import threading
+import numpy as np
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,9 +20,11 @@ from contextlib import asynccontextmanager
 sys.path.insert(0, os.path.dirname(__file__))
 
 from data_feed import fetch_candles, get_current_price, PAIRS
-from ml_model  import predict as ml_predict, train, MODEL_DIR, FORECAST
+from ml_model  import predict as ml_predict, train, MODEL_DIR, FORECAST, add_features, FEATURE_COLS
 from predictor import draw_chart
 from news_feed import get_upcoming_events, is_safe_to_trade
+from rl_env    import ForexTradingEnv
+from rl_agent  import DQNAgent
 
 _pred_cache: dict = {}
 CACHE_TTL = 30 * 60
@@ -301,3 +304,90 @@ def health():
         "cache_keys": list(_pred_cache.keys()),
         "time":       datetime.utcnow().isoformat(),
     }
+
+
+# ─── RL Signal ────────────────────────────────────────────────────────────────
+
+def rl_model_path(pair: str, tf: str) -> str:
+    return os.path.join(MODEL_DIR, f"rl_{pair}_{tf}.npz")
+
+
+def rl_model_exists(pair: str, tf: str) -> bool:
+    return os.path.exists(rl_model_path(pair, tf))
+
+
+@app.get("/rl_signal")
+def rl_signal_endpoint(
+    pair: str = Query(default="EURUSD"),
+    tf:   str = Query(default="1h"),
+):
+    """
+    RL trading signal — what action would the DQN agent take right now?
+    Returns action (BUY/SELL/HOLD), Q-values, and confidence %.
+    Model must be pre-trained via rl_train.py.
+    """
+    pair = pair.upper()
+    if pair not in PAIRS:
+        raise HTTPException(400, f"Unknown pair '{pair}'.")
+    if tf not in VALID_TFS:
+        raise HTTPException(400, f"Invalid tf '{tf}'.")
+
+    path = rl_model_path(pair, tf)
+    if not os.path.exists(path):
+        raise HTTPException(503, f"RL model not trained yet for {pair} {tf}. "
+                                  f"Run: python rl_train.py {pair} --tf {tf}")
+
+    try:
+        df_raw = fetch_candles(tf, pair=pair)
+        if df_raw is None or df_raw.empty:
+            raise RuntimeError("No market data")
+
+        df   = add_features(df_raw)
+        feat = df[FEATURE_COLS].values[-1].astype("float32")   # last bar (12 dims)
+
+        # Position features = 0 (assume we are flat, deciding whether to enter)
+        state = np.concatenate([feat, np.zeros(3, dtype="float32")])  # shape (15,)
+
+        agent  = DQNAgent.load(path, state_dim=ForexTradingEnv.STATE_DIM)
+        result = agent.signal(state)
+
+        return {
+            "pair":        pair,
+            "display":     PAIRS[pair]["display"],
+            "tf":          tf,
+            **result,
+            "model_path":  os.path.basename(path),
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+        }
+
+    except FileNotFoundError as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"RL signal error: {e}")
+
+
+@app.get("/rl_signal/all")
+def rl_signal_all(tf: str = Query(default="1h")):
+    """RL signals for all pairs on one timeframe."""
+    if tf not in VALID_TFS:
+        raise HTTPException(400, f"Invalid tf '{tf}'.")
+
+    results = {}
+    for pk in PAIRS:
+        try:
+            path = rl_model_path(pk, tf)
+            if not os.path.exists(path):
+                results[pk] = {"action": "NO_MODEL", "confidence": 0}
+                continue
+
+            df_raw = fetch_candles(tf, pair=pk)
+            df     = add_features(df_raw)
+            feat   = df[FEATURE_COLS].values[-1].astype("float32")
+            state  = np.concatenate([feat, np.zeros(3, dtype="float32")])
+
+            agent  = DQNAgent.load(path, state_dim=ForexTradingEnv.STATE_DIM)
+            results[pk] = agent.signal(state)
+        except Exception as e:
+            results[pk] = {"action": "ERROR", "error": str(e), "confidence": 0}
+
+    return {"rl_signals": results, "tf": tf, "timestamp": datetime.utcnow().isoformat()}
