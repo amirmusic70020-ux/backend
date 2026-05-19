@@ -244,12 +244,12 @@ def check_closed_positions():
     Compare current MT5 positions against the previous snapshot.
     Any position that disappeared (TP hit, SL hit, manual close) sends
     a Telegram close notification.
+    Returns the current positions dict so the caller can update the snapshot.
     """
     global _prev_positions
 
     current_raw  = get_open_positions()
     current_dict = {p["ticket"]: p for p in current_raw}
-    balance      = get_balance()
 
     for ticket, prev in _prev_positions.items():
         if ticket not in current_dict:
@@ -259,18 +259,14 @@ def check_closed_positions():
                 bid, ask = get_current_price(pair)
                 if prev["type"] == "BUY":
                     close_price = bid
-                    profit = (bid - prev["open_price"]) * PAIRS.get(pair, {}).get("pip_factor", 10000) / 10
                 else:
                     close_price = ask
-                    profit = (prev["open_price"] - ask) * PAIRS.get(pair, {}).get("pip_factor", 10000) / 10
             except Exception:
                 close_price = 0.0
-                profit      = prev.get("profit", 0.0)
 
             label = PAIRS.get(pair, {}).get("display", pair)
-            log.info(f"[{label}] 🏁 Position #{ticket} closed | "
-                     f"Entry: {prev['open_price']} → Close: ~{close_price:.5f} | "
-                     f"P&L: {profit:+.2f}")
+            log.info(f"[{label}] Position #{ticket} closed | "
+                     f"Entry: {prev['open_price']} -> Close: ~{close_price:.5f}")
 
             # Convert P&L to pips for public channel
             pip_factor = PAIRS.get(pair, {}).get("pip_factor", 10000)
@@ -297,8 +293,9 @@ def check_closed_positions():
             except Exception as e:
                 log.warning(f"[Telegram] notify_close error: {e}")
 
-    # Update snapshot for next cycle
-    _prev_positions = current_dict
+    # NOTE: _prev_positions is updated in the main loop AFTER scanning,
+    # so newly placed orders are captured in the snapshot too.
+    return current_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,9 +499,10 @@ def run(pairs: list, tf: str, dry_run: bool):
             log.info(f"{'─'*50}")
 
             # Check for closed positions before scanning new ones
+            current_snapshot = {}
             if not dry_run:
                 try:
-                    check_closed_positions()
+                    current_snapshot = check_closed_positions()
                 except Exception as e:
                     log.warning(f"Close-check error: {e}")
 
@@ -518,6 +516,19 @@ def run(pairs: list, tf: str, dry_run: bool):
                     scan_pair(pair, tf, dry_run=dry_run)
                 except Exception as e:
                     log.error(f"[{pair}] Unexpected error: {e}", exc_info=True)
+
+            # Update position snapshot AFTER scanning so new orders are captured
+            if not dry_run:
+                try:
+                    fresh = get_open_positions()
+                    _prev_positions.update({p["ticket"]: p for p in fresh})
+                    # also remove tickets no longer open
+                    open_tickets = {p["ticket"] for p in fresh}
+                    for t in list(_prev_positions.keys()):
+                        if t not in open_tickets:
+                            _prev_positions.pop(t, None)
+                except Exception as e:
+                    log.warning(f"Snapshot update error: {e}")
 
             next_scan = datetime.fromtimestamp(
                 time.time() + CHECK_EVERY_SEC, tz=timezone.utc
