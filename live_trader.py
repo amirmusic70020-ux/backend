@@ -327,14 +327,14 @@ def check_closed_positions():
             try:
                 import MetaTrader5 as mt5
                 from datetime import timedelta
-                # Search deals in last 7 days for this position ticket
+                # Search deals in last 7 days, then manually filter by position_id
                 date_from = datetime.now(timezone.utc) - timedelta(days=7)
                 date_to   = datetime.now(timezone.utc) + timedelta(hours=1)
-                deals = mt5.history_deals_get(date_from, date_to, position=ticket)
-                if deals:
-                    # The closing deal is the one that's not the opening entry
-                    # entry deal has entry=DEAL_ENTRY_IN, close has DEAL_ENTRY_OUT
-                    for deal in deals:
+                all_deals = mt5.history_deals_get(date_from, date_to)
+                if all_deals:
+                    # Filter only deals belonging to THIS position ticket
+                    pos_deals = [d for d in all_deals if d.position_id == ticket]
+                    for deal in pos_deals:
                         if deal.entry == mt5.DEAL_ENTRY_OUT or deal.entry == mt5.DEAL_ENTRY_INOUT:
                             close_price = deal.price
                             real_profit = deal.profit
@@ -405,8 +405,9 @@ def scan_pair(pair: str, tf: str, dry_run: bool = False):
 
     # 3. News safety check — skip if high-impact event in next 2 hours
     try:
-        if not is_safe_to_trade(pair, hours_ahead=2):
-            log.info(f"[{label}] ⚠️  High-impact news in next 2h — skipping to protect position")
+        news_check = is_safe_to_trade(pair, hours_ahead=2)
+        if not news_check["safe"]:
+            log.info(f"[{label}] {news_check['reason']} — skipping")
             return
     except Exception as e:
         log.warning(f"[{label}] News check failed ({e}) — proceeding anyway")
