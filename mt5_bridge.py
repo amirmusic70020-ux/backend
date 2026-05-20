@@ -255,6 +255,58 @@ def modify_position_sl(ticket: int, new_sl: float, new_tp: float = None) -> dict
     return {"success": False, "message": result.comment if result else "Failed"}
 
 
+# ─── Partial close ────────────────────────────────────────────────────────────
+
+def partial_close_position(ticket: int, close_ratio: float = 0.5) -> dict:
+    """Close a fraction of an open position. Default: 50%."""
+    positions = mt5.positions_get()
+    if positions is None:
+        return {"success": False, "message": "No positions"}
+
+    pos = next((p for p in positions if p.ticket == ticket), None)
+    if pos is None:
+        return {"success": False, "message": f"Ticket {ticket} not found"}
+
+    sym_info = mt5.symbol_info(pos.symbol)
+    if sym_info is None:
+        return {"success": False, "message": "No symbol info"}
+
+    vol_step = sym_info.volume_step
+    vol_min  = sym_info.volume_min
+    close_vol = round(pos.volume * close_ratio / vol_step) * vol_step
+    close_vol = round(max(vol_min, close_vol), 2)
+
+    if close_vol >= pos.volume:
+        close_vol = round(pos.volume / 2, 2)
+
+    tick = mt5.symbol_info_tick(pos.symbol)
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price      = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price      = tick.ask
+
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       pos.symbol,
+        "volume":       close_vol,
+        "type":         close_type,
+        "position":     ticket,
+        "price":        price,
+        "deviation":    20,
+        "magic":        20250518,
+        "comment":      "RadarFX partial",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+
+    result = mt5.order_send(request)
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        return {"success": True, "ticket": ticket, "closed_vol": close_vol}
+    return {"success": False, "message": result.comment if result else "Failed"}
+
+
 # ─── Close position ───────────────────────────────────────────────────────────
 
 def close_position(ticket: int) -> dict:

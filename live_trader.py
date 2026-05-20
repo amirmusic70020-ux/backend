@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from mt5_bridge  import (connect, disconnect, get_candles, get_account,
                           get_balance, place_order, get_open_positions,
-                          get_current_price, modify_position_sl)
+                          get_current_price, modify_position_sl,
+                          partial_close_position)
 from ml_model    import predict as ml_predict, add_features, FEATURE_COLS
 from rl_agent    import DQNAgent
 from data_feed   import PAIRS
@@ -281,9 +282,18 @@ def check_breakeven():
 
         if progress >= BREAKEVEN_TRIGGER:
             new_sl = round(entry, dec)
+
+            # 1. Partial close — lock in 50% profit
+            pc = partial_close_position(ticket, close_ratio=0.5)
+            if pc.get("success"):
+                log.info(f"[{pair}] Partial close #{ticket} — {pc['closed_vol']} lots locked")
+            else:
+                log.warning(f"[{pair}] Partial close failed #{ticket}: {pc.get('message')}")
+
+            # 2. Move SL to break-even on remaining half
             result = modify_position_sl(ticket, new_sl=new_sl)
             if result.get("success"):
-                log.info(f"[{pair}] Break-even activated #{ticket} — SL moved to {new_sl}")
+                log.info(f"[{pair}] Break-even #{ticket} — SL -> {new_sl}")
             else:
                 log.warning(f"[{pair}] Break-even failed #{ticket}: {result.get('message')}")
 
