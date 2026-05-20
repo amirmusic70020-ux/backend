@@ -131,7 +131,8 @@ def notify_open(pair: str, action: str, entry: float, sl: float,
         f"💎 SL set at  {dash}  <code>{sl}</code> ❌  <i>({sl_pips:.0f} pips)</i>\n"
         f"💎 TP set at  {dash}  <code>{tp}</code> ✅  <i>({tp_pips:.0f} pips)</i>\n"
         f"\n"
-        f"R : R   <b>1 : {rr}</b>   ·   Size {lot} lot"
+        f"R : R   <b>1 : {rr}</b>\n"
+        f"⚠️ Manage your own risk — max 1–2% per trade"
     )
 
     if df is not None and not df.empty:
