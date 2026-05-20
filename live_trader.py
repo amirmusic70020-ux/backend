@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from mt5_bridge  import (connect, disconnect, get_candles, get_account,
                           get_balance, place_order, get_open_positions,
-                          get_current_price)
+                          get_current_price, modify_position_sl)
 from ml_model    import predict as ml_predict, add_features, FEATURE_COLS
 from rl_agent    import DQNAgent
 from data_feed   import PAIRS
@@ -233,6 +233,59 @@ def get_rl_filter(pair: str, df) -> str:
     except Exception as e:
         log.warning(f"[{pair}] RL filter error: {e}")
         return "SKIP"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BREAK-EVEN  — move SL to entry when price reaches 50% of TP
+# ─────────────────────────────────────────────────────────────────────────────
+
+BREAKEVEN_TRIGGER = 0.50   # move SL when 50% of TP distance reached
+
+def check_breakeven():
+    """
+    For each open position, if price has moved 50% toward TP,
+    move the SL to entry price (break-even).
+    """
+    positions = get_open_positions()
+    for p in positions:
+        ticket     = p["ticket"]
+        entry      = p["open_price"]
+        sl         = p["sl"]
+        tp         = p["tp"]
+        trade_type = p["type"]
+        pair       = p["symbol"]
+        dec        = PAIRS.get(pair, {}).get("decimals", 5)
+
+        if tp == 0 or sl == 0:
+            continue
+
+        try:
+            bid, ask = get_current_price(pair)
+            price = bid if trade_type == "BUY" else ask
+        except Exception:
+            continue
+
+        tp_distance    = abs(tp - entry)
+        moved_distance = abs(price - entry)
+
+        # Already at break-even or better
+        if trade_type == "BUY" and sl >= entry:
+            continue
+        if trade_type == "SELL" and sl <= entry:
+            continue
+
+        # Check if 50% of TP distance reached
+        if tp_distance == 0:
+            continue
+        progress = moved_distance / tp_distance
+
+        if progress >= BREAKEVEN_TRIGGER:
+            new_sl = round(entry, dec)
+            result = modify_position_sl(ticket, new_sl=new_sl)
+            if result.get("success"):
+                log.info(f"[{pair}] Break-even activated #{ticket} — SL moved to {new_sl}")
+            else:
+                log.warning(f"[{pair}] Break-even failed #{ticket}: {result.get('message')}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +558,12 @@ def run(pairs: list, tf: str, dry_run: bool):
                     current_snapshot = check_closed_positions()
                 except Exception as e:
                     log.warning(f"Close-check error: {e}")
+
+                # Move SL to break-even if 50% of TP reached
+                try:
+                    check_breakeven()
+                except Exception as e:
+                    log.warning(f"Break-even check error: {e}")
 
             # Daily report — send once at 21:00 UTC
             _maybe_send_daily_report(dry_run)

@@ -225,6 +225,36 @@ def place_order(pair: str, action: str, lot: float,
         }
 
 
+# ─── Modify SL/TP ────────────────────────────────────────────────────────────
+
+def modify_position_sl(ticket: int, new_sl: float, new_tp: float = None) -> dict:
+    """Move SL (and optionally TP) for an open position."""
+    positions = mt5.positions_get()
+    if positions is None:
+        return {"success": False, "message": "No positions"}
+
+    pos = next((p for p in positions if p.ticket == ticket), None)
+    if pos is None:
+        return {"success": False, "message": f"Ticket {ticket} not found"}
+
+    sym_info = mt5.symbol_info(pos.symbol)
+    digits   = sym_info.digits if sym_info else 5
+    tp_use   = round(new_tp, digits) if new_tp is not None else pos.tp
+
+    request = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "symbol":   pos.symbol,
+        "position": ticket,
+        "sl":       round(new_sl, digits),
+        "tp":       tp_use,
+    }
+
+    result = mt5.order_send(request)
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        return {"success": True, "ticket": ticket}
+    return {"success": False, "message": result.comment if result else "Failed"}
+
+
 # ─── Close position ───────────────────────────────────────────────────────────
 
 def close_position(ticket: int) -> dict:
