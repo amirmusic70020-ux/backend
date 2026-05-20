@@ -23,14 +23,14 @@ from data_feed  import PAIRS
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Candles to fetch per timeframe (≈ 2 years)
+# Candles to fetch per timeframe (~3 months)
 TF_CANDLES = {
-    "1h":    17_500,   # 2 years × 365 × ~24h trading
-    "4h":     4_400,   # 2 years × 365 × ~6
-    "daily":    730,   # 2 years
-    "15m":   70_000,   # 2 years × 365 × 96
-    "30m":   35_000,
-    "5m":   210_000,
+    "1h":     2_200,   # 3 months x ~24h trading
+    "4h":       550,   # 3 months x ~6
+    "daily":     65,   # 3 months
+    "15m":    8_500,
+    "30m":    4_300,
+    "5m":    25_000,
 }
 
 DEFAULT_TF   = ["1h"]
@@ -44,32 +44,32 @@ def train_one(pair: str, tf: str) -> bool:
     n = TF_CANDLES.get(tf, 17_500)
     display = PAIRS[pair]["display"]
 
-    print(f"\n  {'─'*52}")
+    print(f"\n  {'-'*52}")
     print(f"  {display}  |  {tf}  |  fetching {n:,} candles from MT5...")
-    print(f"  {'─'*52}")
+    print(f"  {'-'*52}")
 
     df = get_candles(pair, tf, n=n)
     if df is None or df.empty:
-        print(f"  ✗ No data from MT5 for {pair} {tf}")
+        print(f"  [X] No data from MT5 for {pair} {tf}")
         return False
 
-    print(f"  Candles : {len(df):,}  ({df.index[0].date()} → {df.index[-1].date()})")
+    print(f"  Candles : {len(df):,}  ({df.index[0].date()} to {df.index[-1].date()})")
 
     df_feat = add_features(df)
     X, Y    = make_sequences(df_feat)
 
     if len(X) < 100:
-        print(f"  ✗ Not enough sequences ({len(X)}). Skipping.")
+        print(f"  [X] Not enough sequences ({len(X)}). Skipping.")
         return False
 
-    print(f"  Sequences: {len(X):,}  — training...")
+    print(f"  Sequences: {len(X):,}  -- training...")
 
     t0      = time.time()
     pair_key = f"{pair}_{tf}{MODEL_SUFFIX}"
     train(df, pair=pair_key)
     elapsed = time.time() - t0
 
-    print(f"  ✓ Done in {elapsed:.0f}s  →  models/{pair_key}_*.pkl")
+    print(f"  [OK] Done in {elapsed:.0f}s  ->  models/{pair_key}_*.pkl")
     return True
 
 
@@ -88,13 +88,13 @@ def main():
     pairs   = [args.pair.upper()] if args.pair else list(PAIRS.keys())
     tf_list = ALL_TF if args.all_tf else [args.tf]
 
-    print(f"\n{'═'*55}")
-    print(f"  RadarFX MT5 Trainer  —  v2 Models")
+    print(f"\n{'='*55}")
+    print(f"  RadarFX MT5 Trainer  --  v2 Models")
     print(f"  Pairs     : {pairs}")
     print(f"  Timeframes: {tf_list}")
-    print(f"  Data      : ~2 years from MT5")
+    print(f"  Data      : ~3 months from MT5")
     print(f"  Suffix    : {MODEL_SUFFIX}")
-    print(f"{'═'*55}")
+    print(f"{'='*55}")
 
     if not connect():
         print("\n✗ Cannot connect to MT5. Make sure terminal is open.")
@@ -109,13 +109,13 @@ def main():
 
     disconnect()
 
-    print(f"\n{'═'*55}")
+    print(f"\n{'='*55}")
     print("  Results:")
     for key, status in results.items():
         print(f"    {key:25s}  {status}")
-    print(f"{'═'*55}")
+    print(f"{'='*55}")
     print(f"\n  Next: python backtest_compare.py")
-    print(f"  If v2 is better → python switch_to_v2.py\n")
+    print(f"  If v2 is better: python switch_to_v2.py\n")
 
 
 if __name__ == "__main__":

@@ -144,7 +144,7 @@ class DQNAgent:
       - target net  : evaluates that action's value (reduces overestimation)
     """
 
-    def __init__(self, state_dim: int, n_actions: int = 3,
+    def __init__(self, state_dim: int = 15, n_actions: int = 3,
                  lr: float = 5e-4, gamma: float = 0.99,
                  eps_start: float = 1.0, eps_end: float = 0.05,
                  eps_decay: float = 0.994,
@@ -237,7 +237,7 @@ class DQNAgent:
         state should be built from the last bar's features with position=[0,0,0]
         (i.e. assume we're flat and deciding whether to enter).
         """
-        q_vals  = self.q.forward(state.reshape(1, -1))[0]
+        q_vals  = self.q.forward(np.array(state, dtype=np.float32).reshape(1, -1))[0]
         action  = int(np.argmax(q_vals))
 
         # Softmax confidence

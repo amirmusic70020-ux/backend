@@ -134,9 +134,9 @@ def train(df: pd.DataFrame, pair: str = "EURUSD") -> None:
         save_path = os.path.join(MODEL_DIR, f"{pair}_{q_name}.pkl")
         with open(save_path, "wb") as f:
             pickle.dump(models_this_q, f)
-        print(f"  ✓ Saved → {save_path}")
+        print(f"  [OK] Saved -> {save_path}")
 
-    print(f"\n  ✓ Training complete for {pair}")
+    print(f"\n  [OK] Training complete for {pair}")
 
 
 # ─── Predict ──────────────────────────────────────────────────────────────────
