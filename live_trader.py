@@ -171,14 +171,15 @@ def get_ml_signal(pair: str, tf: str, df) -> dict:
     bear_end    = float(bear_prices[-1])
     median_move = (median_end - last_close) * pip_factor   # pips (+/-)
 
-    MIN_SL_PIPS = 8   # حداقل فاصله SL از entry
+    # Minimum SL distance per pair — gold needs much more room than forex
+    MIN_SL_PIPS = 50 if pair == "XAUUSD" else 8
 
     if median_move > MIN_MOVE_PIPS:
         signal = "BUY"
         tp     = round(bull_end, dec)
         sl_raw = round(bear_end, dec)
         # SL باید زیر entry باشه برای BUY
-        if sl_raw >= last_close:
+        if sl_raw >= last_close or abs(last_close - sl_raw) * pip_factor < MIN_SL_PIPS:
             sl = round(last_close - MIN_SL_PIPS / pip_factor, dec)
         else:
             sl = sl_raw
@@ -187,7 +188,7 @@ def get_ml_signal(pair: str, tf: str, df) -> dict:
         tp     = round(bear_end, dec)
         sl_raw = round(bull_end, dec)
         # SL باید بالای entry باشه برای SELL
-        if sl_raw <= last_close:
+        if sl_raw <= last_close or abs(sl_raw - last_close) * pip_factor < MIN_SL_PIPS:
             sl = round(last_close + MIN_SL_PIPS / pip_factor, dec)
         else:
             sl = sl_raw
@@ -316,23 +317,44 @@ def check_closed_positions():
 
     for ticket, prev in _prev_positions.items():
         if ticket not in current_dict:
-            # Position is gone — figure out rough P&L from last known price
             pair  = prev["symbol"].replace("m", "")   # strip micro suffix if any
-            try:
-                bid, ask = get_current_price(pair)
-                if prev["type"] == "BUY":
-                    close_price = bid
-                else:
-                    close_price = ask
-            except Exception:
-                close_price = 0.0
-
             label = PAIRS.get(pair, {}).get("display", pair)
-            log.info(f"[{label}] Position #{ticket} closed | "
-                     f"Entry: {prev['open_price']} -> Close: ~{close_price:.5f}")
-
-            # Convert P&L to pips for public channel
             pip_factor = PAIRS.get(pair, {}).get("pip_factor", 10000)
+
+            # Try to get REAL close price + profit from MT5 deal history
+            close_price = 0.0
+            real_profit = None
+            try:
+                import MetaTrader5 as mt5
+                from datetime import timedelta
+                # Search deals in last 7 days for this position ticket
+                date_from = datetime.now(timezone.utc) - timedelta(days=7)
+                date_to   = datetime.now(timezone.utc) + timedelta(hours=1)
+                deals = mt5.history_deals_get(date_from, date_to, position=ticket)
+                if deals:
+                    # The closing deal is the one that's not the opening entry
+                    # entry deal has entry=DEAL_ENTRY_IN, close has DEAL_ENTRY_OUT
+                    for deal in deals:
+                        if deal.entry == mt5.DEAL_ENTRY_OUT or deal.entry == mt5.DEAL_ENTRY_INOUT:
+                            close_price = deal.price
+                            real_profit = deal.profit
+                            break
+            except Exception as ex:
+                log.warning(f"[{label}] Could not read MT5 history: {ex}")
+
+            # Fallback to current price if history not available
+            if close_price == 0.0:
+                try:
+                    bid, ask = get_current_price(pair)
+                    close_price = bid if prev["type"] == "BUY" else ask
+                except Exception:
+                    close_price = 0.0
+
+            log.info(f"[{label}] Position #{ticket} closed | "
+                     f"Entry: {prev['open_price']} -> Close: {close_price:.5f} "
+                     f"| P&L: {real_profit if real_profit is not None else '?'}")
+
+            # Convert P&L to pips
             if prev["type"] == "BUY":
                 pips_closed = round((close_price - prev["open_price"]) * pip_factor, 1)
             else:
